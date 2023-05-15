@@ -35,7 +35,7 @@ should_n_diagram   = False
 # ---- User parameters - change this ------------------
 project_name = 'sensitivity_sweep'
 year         = 2030             # Choose year
-n_hrs        = 168
+n_hrs        = 8760
 
 # Choose which countries to include of this list, comment unwanted out.
 connected_countries =  [

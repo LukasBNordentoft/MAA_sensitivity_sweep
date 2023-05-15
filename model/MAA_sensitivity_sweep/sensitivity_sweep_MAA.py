@@ -32,7 +32,7 @@ study_name = 'sensitivity_sweep'
 variables = {
                 'x1':('Generator', 'P2X'),
                 'x2':('Generator', 'Data'),
-                # 'x3':('Store',     'Storage'),
+                'x3':('Store',     'Storage'),
                 # 'x4':('Link',      'link_Denmark'),
                 # 'x5':('Link',      'link_Norway'),
                 # 'x6':('Link',      'link_Germany'),
@@ -45,12 +45,7 @@ input_name        = f'v_{year}_{study_name}_opt.nc'
 MAA_network_names = f'v_{year}_{study_name}_{len(variables)}MAA_{int(mga_slack*100)}p_'
 MAA_solutions     = f'v_{year}_{study_name}_{len(variables)}MAA_{int(mga_slack*100)}p_'
 
-#%% Load and copy network
-
-n = pypsa.Network(input_name) #Load network from netcdf file
-
-n_optimum   = n.copy() # Save copy of optimum system
-n_objective = n.objective # Save optimum objective
+# n_backup = n.copy()
 
 #%% Load data to recreate constraints
 # ----- Dataframe with tech data ---------
@@ -70,44 +65,9 @@ connected_countries =  [
                         "United Kingdom"
                         ]
 
-# ----- Save data in network ---------
-n.area_use            = tm.get_area_use()
-n.total_area          = island_area 
-n.link_sum_max        = n.generators.p_nom_max['Wind']
-n.main_links          = n.links.loc[n.links.bus0 == "Energy Island"].index
-n.variables_set       = variables
-n.connected_countries = connected_countries
-
-# Save variables for objective function modification
-n.MB        = n_optimum.generators.loc['MoneyBin'].capital_cost
-n.revenue   = abs(n_optimum.generators_t.p['Data'].sum())*tech_df['marginal cost']['datacenter'] + abs(n.generators_t.p['P2X'].sum())*tech_df['marginal cost']['hydrogen']
-
 # Calculate total local demand costs, NOT revenues
 mga_variables = list(variables.keys())
 techs = [variables[x][1] for x in mga_variables]
-
-local_cost = 0
-for tech in techs:
-    
-    if tech == 'Storage' and not n.stores.e_nom_opt[tech] == 0:
-        
-        capital_cost  = n.stores.capital_cost[tech]
-        e_nom         = n.stores.e_nom_opt[tech]
-        marginal_cost = n.stores.marginal_cost[tech]
-        e_sum         = n.stores_t.e[tech].sum()
-        
-        local_cost += capital_cost * e_nom + marginal_cost * e_sum
-
-    elif tech == 'Data' or tech == 'P2X':
-        capital_cost = n.generators.capital_cost[tech]
-        p_nom        = n.generators.p_nom_opt[tech]
-        # marginal cost not included since that is revenue
-        
-        local_cost += capital_cost * p_nom
-        
-n.local_cost = local_cost
-
-n_backup = n.copy()
 
 #%% MAA - find directions and search
 
@@ -132,15 +92,19 @@ def search_direction(direction,mga_variables):
 
     return [all_variable_values[v] for v in mga_variables]
 
+tic()
 
-for percent in [0.6, 0.8, 1, 1.2]:
+percent_range = np.linspace(0.5, 1.5, 11)
+
+#%%
+for percent in percent_range:
     
     for tech in techs:
         
-        n = n_backup.copy()
+        #%% Solve network optimum with new cost
         
-        n.generators.capital_cost[tech] = n.generators.capital_cost[tech] * percent
-        
+        n = pypsa.Network(input_name) #Load optimum network from netcdf file
+
         # ----- Save data in network ---------
         n.area_use            = tm.get_area_use()
         n.total_area          = island_area 
@@ -149,7 +113,54 @@ for percent in [0.6, 0.8, 1, 1.2]:
         n.variables_set       = variables
         n.connected_countries = connected_countries
         
+        # Change parameter before solve
+        if tech == 'Storage':
+            n.stores.capital_cost[tech] = n.stores.capital_cost[tech] * percent
+        else:
+            n.generators.capital_cost[tech] = n.generators.capital_cost[tech] * percent
+
+        # Find local cost
+        local_cost = 0
+        for tech_local in techs:
+            
+            if tech_local == 'Storage' and not n.stores.e_nom_opt[tech_local] == 0:
+                
+                capital_cost  = n.stores.capital_cost[tech_local]
+                e_nom         = n.stores.e_nom_opt[tech_local]
+                marginal_cost = n.stores.marginal_cost[tech_local]
+                e_sum         = n.stores_t.e[tech_local].sum()
+                
+                local_cost += capital_cost * e_nom + marginal_cost * e_sum
+
+            elif tech_local == 'Data' or tech_local == 'P2X':
+                capital_cost = n.generators.capital_cost[tech_local]
+                p_nom        = n.generators.p_nom_opt[tech_local]
+                # marginal cost not included since that is revenue
+                
+                local_cost += capital_cost * p_nom
+                
         n.local_cost = local_cost
+        
+        
+        def extra_functionalities(n, snapshots):
+            gm.area_constraint(n, snapshots) # Add an area constraint
+            gm.link_constraint(n, snapshots) # Add constraint on the link capacity sum
+            gm.marry_links(n, snapshots) # Add constraint to link capacities of links
+        
+        # Solve optimum network
+        n.lopf(
+               pyomo = False,
+               solver_name = 'gurobi', 
+               keep_shadowprices = True, # Keep dual-values
+               keep_references = True,   
+               extra_functionality = extra_functionalities,
+               )
+        
+        # Save optimum network for this iteration
+        n_optimum   = n.copy() # Save copy of optimum system
+        n_objective = n.objective # Save optimum objective
+        n.export_to_netcdf(f'optimals/n_optimal_{tech}_{percent}.nc')
+
 
         #%% MAA setup
 
@@ -166,8 +177,8 @@ for percent in [0.6, 0.8, 1, 1.2]:
             gm.define_mga_constraint_local(n,snapshots,options['mga_slack'])
             gm.define_mga_objective(n,snapshots,direction,options)
 
+
         #%% MGA - Search 1 direction
-        tic()
 
         direction = direction         # 1 means minimize, -1 means maximize 
         mga_variables = mga_variables # The variables that we are investigating
@@ -181,10 +192,10 @@ for percent in [0.6, 0.8, 1, 1.2]:
                 keep_shadowprices = True,
                 skip_objective    = True,
                 solver_options    = {'LogToConsole':0,
-                                     'crossover':0,
-                                     'BarConvTol' : 1e-6,                 
-                                     'FeasibilityTol' : 1e-2,
-                                     'threads':2},
+                                      'crossover':0,
+                                      'BarConvTol' : 1e-6,                 
+                                      'FeasibilityTol' : 1e-2,
+                                      'threads':2},
                 extra_functionality = lambda n,s: extra_functionality(n,s,options,direction)
             )
 
@@ -220,7 +231,7 @@ for percent in [0.6, 0.8, 1, 1.2]:
                 res       = search_direction(direction_i, mga_variables)
                 solutions = np.append(solutions, np.array([res]), axis=0)
                 
-                n.export_to_netcdf('results/' + MAA_network_names + str(j)+ '-'+ str(i) + '.nc')
+                # n.export_to_netcdf('results/' + MAA_network_names + str(j)+ '-'+ str(i) + '.nc')
                 print(f'\n #### Exported MAA network: Loop {j}, direction {i} ####    \
                         \n Directions in this loop: {len(directions)}   \
                         \n Current Epsilon: {epsilon} \n')
@@ -238,11 +249,6 @@ for percent in [0.6, 0.8, 1, 1.2]:
             print('\n ####### EPSILON ###############')
             print(' ' + str(epsilon) + '\n')
             
-        np.save(MAA_solutions + f'sweep_{tech}_{percent}_' + 'solutions.npy', solutions)
+        np.save( 'sweep_results/' + MAA_solutions + f'sweep_{tech}_{percent}_' + 'solutions.npy', solutions)
         
-        
-        
-print(f'\n It took {round(toc(), 2)} sec for a simulation with {len(variables)} variables. \n')
-
-#%%
-gm.its_britney_bitch()
+print(f'\n MAA sweep took {round(toc(), 2)} sec for {len(variables)} variables. \n')
